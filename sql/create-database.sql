@@ -165,3 +165,35 @@ JOIN "Employee" e ON bp."EmployeeId" = e."Id"
 -- ROW-LEVEL SECURITY: Bonus payments are completely filtered out if the user
 -- does not have the "Salary:Read" permission OR lacks access to the employee's department.
 WHERE has_permission('Salary:Read') AND has_department_access(e."Department");
+
+
+-- ============================================================================
+-- APPLICATION USER & PERMISSIONS (Least Privilege)
+-- ============================================================================
+
+DO
+$do$
+BEGIN
+   IF NOT EXISTS (
+      SELECT FROM pg_catalog.pg_roles
+      WHERE  rolname = 'app_user') THEN
+      CREATE ROLE app_user LOGIN PASSWORD 'app_user';
+   END IF;
+END
+$do$;
+
+-- Grant basic schema access
+GRANT USAGE ON SCHEMA public TO app_user;
+
+-- Grant explicit SELECT access ONLY to the secure views
+-- The user has NO access to the physical tables "Employee" or "BonusPayment"
+GRANT SELECT ON "vw_Employee_Secure" TO app_user;
+GRANT SELECT ON "vw_BonusPayment_Secure" TO app_user;
+
+-- Grant read access to the ABAC metadata tables.
+-- This is required because the helper functions (has_permission, etc.)
+-- are executed in the context of the invoker (SECURITY INVOKER by default).
+GRANT SELECT ON "Role" TO app_user;
+GRANT SELECT ON "Role_Permission" TO app_user;
+GRANT SELECT ON "User_Attribute" TO app_user;
+GRANT SELECT ON "User_Role" TO app_user;

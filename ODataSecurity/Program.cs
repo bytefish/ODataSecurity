@@ -9,6 +9,11 @@ using System.Data.Common;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Configuration
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .AddJsonFile("appsettings.Development.json", optional: true, reloadOnChange: true)
+    .AddEnvironmentVariables();
+
 // Allow access to HttpContext in services, especially for the CurrentUserService to get the current user's identity.
 builder.Services.AddHttpContextAccessor();
 
@@ -22,7 +27,7 @@ builder.Services.AddScoped<PostgresSecurityInterceptor>();
 // Add the DbContext and configure it to use PostgreSQL. The connection string is read from configuration, with a fallback to
 // a default value for local development.
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? "Host=localhost;Port=54320;Database=ODataSecurityDemo;Username=postgres;Password=postgres";
+    ?? "Host=localhost;Port=54320;Database=ODataSecurityDemo;Username=app_user;Password=app_user";
 
 builder.Services.AddDbContext<AppDbContext>((sp, opt) =>
 {
