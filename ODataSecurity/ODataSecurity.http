@@ -1,0 +1,31 @@
+@HostAddress = https://localhost:5000
+
+### Simple request as a standard employee (Masking applies)
+# Expectation: Returns records, but AnnualSalary and BonusGoal are NULL.
+GET {{HostAddress}}/odata/Employees
+X-User-Id: jane.smith@firma.de
+
+### Simple request as a standard employee and $expand (Masking applies)
+# Expectation: Returns records, but AnnualSalary and BonusGoal are NULL and no Bonus Payments.
+GET {{HostAddress}}/odata/Employees?$expand=BonusPayments
+X-User-Id: jane.smith@firma.de
+
+### Request with $filter (Prevents Data Inference)
+# Expectation: Returns an EMPTY list. Since the salary is NULL for Jane at the database level,
+# the filter fails. She cannot "guess" salaries.
+GET {{HostAddress}}/odata/Employees?$filter=AnnualSalary%20gt%2060000
+X-User-Id: jane.smith@firma.de
+
+### Request with $expand (Securing related tables)
+# Expectation: EF Core generates a LEFT JOIN. Since the database connection already knows the User-ID,
+# the Row-Level Security and Field-Level Security are automatically applied to
+# the view 'vw_BonusPayment_Secure'.
+GET {{HostAddress}}/odata/Employees?$expand=BonusPayments
+X-User-Id: hr.boss@firma.de
+
+### Successful $filter as an authorized user
+# Expectation: HR Boss has the "Salary:Read" permission. The database provides him with the real
+# salary data, therefore the OData $filter works correctly and returns 
+# the corresponding employees.
+GET {{HostAddress}}/odata/Employees?$filter=AnnualSalary%20gt%2060000
+X-User-Id: hr.boss@firma.de
