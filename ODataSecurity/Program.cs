@@ -93,7 +93,6 @@ public class CurrentUserService : ICurrentUserService
     }
 }
 
-
 /// <summary>
 /// PostgreSQL-specific interceptor that sets a session variable with the current user's identity.
 /// </summary>

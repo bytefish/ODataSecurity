@@ -5,6 +5,11 @@
 GET {{HostAddress}}/odata/Employees
 X-User-Id: jane.smith@firma.de
 
+### Simple request as HR Boss (Masking does NOT apply)
+# Expectation: Returns records, with AnnualSalary and BonusGoal
+GET {{HostAddress}}/odata/Employees
+X-User-Id: hr.boss@firma.de
+
 ### Simple request as a standard employee and $expand (Masking applies)
 # Expectation: Returns records, but AnnualSalary and BonusGoal are NULL and no Bonus Payments.
 GET {{HostAddress}}/odata/Employees?$expand=BonusPayments
