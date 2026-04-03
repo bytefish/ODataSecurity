@@ -11,7 +11,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Configuration
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .AddJsonFile("appsettings.Development.json", optional: true, reloadOnChange: true)
+    .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: true)
     .AddEnvironmentVariables();
 
 // Allow access to HttpContext in services, especially for the CurrentUserService to get the current user's identity.
@@ -20,21 +20,55 @@ builder.Services.AddHttpContextAccessor();
 // Service used to get the current user's identity. This is crucial for setting the session variable in PostgreSQL for RLS and FLS.
 builder.Services.AddScoped<ICurrentUserService, CurrentUserService>();
 
-// The Interceptor for PostgreSQL that sets the session variable with the current user's identity. This
-// is registered as Scoped because it needs to be resolved per DbContext instance.
-builder.Services.AddScoped<PostgresSecurityInterceptor>();
-
-// Add the DbContext and configure it to use PostgreSQL. The connection string is read from configuration, with a fallback to
-// a default value for local development.
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? "Host=localhost;Port=54320;Database=ODataSecurityDemo;Username=app_user;Password=app_user";
-
-builder.Services.AddDbContext<AppDbContext>((sp, opt) =>
+// Add the DbContext and configure it to use PostgreSQL or SQL Server.
+switch (builder.Environment.EnvironmentName)
 {
-    opt.UseNpgsql(connectionString)
-       // The Interceptor is resolved per DbContext instance (Scoped)
-       .AddInterceptors(sp.GetRequiredService<PostgresSecurityInterceptor>());
-});
+    case "Postgres":
+        {
+            // The Interceptor for PostgreSQL that sets the session variable with the current user's identity. This
+            // is registered as Scoped because it needs to be resolved per DbContext instance.
+            builder.Services.AddScoped<PostgresSecurityInterceptor>();
+
+            builder.Services.AddDbContext<AppDbContext>((sp, opt) =>
+            {
+                string? connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+                if(string.IsNullOrWhiteSpace(connectionString))
+                {
+                    throw new InvalidOperationException("Connection string 'DefaultConnection' is not configured. Please set it in appsettings.json or environment variables.");
+                }
+
+                opt.UseNpgsql(connectionString)
+                   // The Interceptor is resolved per DbContext instance (Scoped)
+                   .AddInterceptors(sp.GetRequiredService<PostgresSecurityInterceptor>());
+            });
+            break;
+        }
+
+    case "SqlServer":
+        {
+            // The Interceptor for SQL Server is registered as well. It sets the user identity in the session context for SQL Server, which can be used
+            // for RLS and FLS in SQL Server. 
+            builder.Services.AddScoped<SqlServerSecurityInterceptor>();
+
+            builder.Services.AddDbContext<AppDbContext>((sp, opt) =>
+            {
+                string? connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+                if (string.IsNullOrWhiteSpace(connectionString))
+                {
+                    throw new InvalidOperationException("Connection string 'DefaultConnection' is not configured. Please set it in appsettings.json or environment variables.");
+                }
+
+                opt.UseSqlServer(connectionString)
+                   // The Interceptor is resolved per DbContext instance (Scoped)
+                   .AddInterceptors(sp.GetRequiredService<SqlServerSecurityInterceptor>());
+            });
+            break;
+        }
+    default:
+        throw new NotImplementedException($"The environment '{builder.Environment.EnvironmentName}' is not supported. Please set the environment to 'Postgres' or 'SqlServer'.");
+}
 
 // Configure the OData model. We define the entity sets for Employee and BonusPayment. The OData endpoint will be available at /odata.
 var odataBuilder = new ODataConventionModelBuilder();
@@ -90,6 +124,44 @@ public class CurrentUserService : ICurrentUserService
     public string GetCurrentUserId()
     {
         return _httpContextAccessor.HttpContext?.Items["CurrentUserId"] as string ?? "anonymous";
+    }
+}
+
+public class SqlServerSecurityInterceptor : DbConnectionInterceptor
+{
+    private readonly ICurrentUserService _currentUserService;
+
+    public SqlServerSecurityInterceptor(ICurrentUserService currentUserService)
+    {
+        _currentUserService = currentUserService;
+    }
+
+    public override async Task ConnectionOpenedAsync(DbConnection connection, ConnectionEndEventData eventData, CancellationToken cancellationToken)
+    {
+        await SetSessionContextAsync(connection, cancellationToken);
+    }
+
+    public override void ConnectionOpened(DbConnection connection, ConnectionEndEventData eventData)
+    {
+        SetSessionContextAsync(connection, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    private async Task SetSessionContextAsync(DbConnection connection, CancellationToken cancellationToken)
+    {
+        var userId = _currentUserService.GetCurrentUserId();
+        using var cmd = connection.CreateCommand();
+        
+        // SQL Server uses sp_set_session_context to safely store context
+        cmd.CommandText = "EXEC sp_set_session_context @key = N'app.current_user', @value = @userId;";
+
+        var param = cmd.CreateParameter();
+        
+        param.ParameterName = "@userId";
+        param.Value = userId;
+        
+        cmd.Parameters.Add(param);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }
 
