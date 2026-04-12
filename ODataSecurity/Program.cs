@@ -127,6 +127,9 @@ public class CurrentUserService : ICurrentUserService
     }
 }
 
+/// <summary>
+/// SQL Server-specific interceptor that sets a session context with the current user's identity. This is used for RLS and FLS in SQL Server.
+/// </summary>
 public class SqlServerSecurityInterceptor : DbConnectionInterceptor
 {
     private readonly ICurrentUserService _currentUserService;
@@ -258,9 +261,9 @@ public class BonusPayment
 // ============================================================================
 
 /// <summary>
-/// DbContext mapping the entities to the secure PostgreSQL views. The views implement Row-Level Security (RLS) and 
+/// DbContext mapping the entities to the secure views. The views implement Row-Level Security (RLS) and 
 /// Field-Level Security (FLS) based on the session variable 'app.current_user' that we set in the 
-/// PostgresSecurityInterceptor.
+/// interceptor.
 /// </summary>
 public class AppDbContext : DbContext
 {

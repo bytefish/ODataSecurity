@@ -96,9 +96,7 @@ BEGIN
 END;
 GO
 
--- ======================================================
--- Authorization
--- ======================================================
+-- Checks if a user is authorized based on a permission and optional attribute
 CREATE OR ALTER FUNCTION [dbo].[fn_Auth] (
     @Permission NVARCHAR(100),
     @AttrKey    NVARCHAR(50) = NULL,
