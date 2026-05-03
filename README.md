@@ -1,16 +1,14 @@
 # Securing an ASP.NET Core OData Service using Attribute-based Access Control
 
-OData is a superpower for frontend developers. By exposing a single endpoint, you give clients the ultimate 
-flexibility to query exactly what they need using `$filter`, shape the payload with `$select`, and fetch 
-related data via `$expand`.
+The last article on securing an OData API using Attribute-based Access Control 
+was a good first step at tackling the problem. But I think the data database 
+model needs to be adjusted.
 
-But when a client can query basically whatever they want, then... how on earth do you secure access to 
-your data? And how do you prevent leaking sensitive information? How do you conditionally show or mask 
-data?
+Modern Identity Providers, such as Microsoft Entra ID, are based on Claims and 
+the previous database model would require us to preprocess the incoming data, 
+which is error-prone.
 
-In this article we'll take a look at using Attribute-based Access Control to secure an ASP.NET Core 
-OData Service. It is built for PostgreSQL and SQL Server, so you are covered with both database 
-systems.
+Let's simplify it.
 
 The code is available in a Git repository at:
 
@@ -41,7 +39,7 @@ at Attribute-based Access Control (ABAC) to provide this level of granularity.
 
 Attribute-based Access Control decides wether a user can access something based on attributes, instead 
 of roles. The attributes are properties of the users, resources, actions, and the environment. Instead 
-of asking *"What role does the user have?"*, ABAC asks *"Do all required match a rule?"*.
+of asking *"What role does the user have?"*, ABAC asks *"Do all required attributes match a rule?"*.
 
 In an ABAC system there are usually four types of attributes to attributes to configure access:
 
@@ -59,9 +57,9 @@ These attributes are then combined into a policy, which is evaluated using a Pol
 I won't go deep into theory here. There are way better resources available, than anything I'd 
 come up with. Let's just solve the problem at hand, which is securing our data using the database.
 
-## ASP.NET Core OData Example ##
+## ASP.NET Core OData API ##
 
-The idea is pretty simple. The database only exposes views to the user. The Views are using a session 
+The idea is pretty simple. The database only exposes views to the user. The views are using a session 
 variable to filter out or mask data for a given user, the filtering being based on attributes and 
 permissions synced to the database.
 
@@ -324,56 +322,79 @@ CREATE TABLE IF NOT EXISTS "Role_Permission" (
     PRIMARY KEY ("RoleName", "Permission")
 );
 
-CREATE TABLE IF NOT EXISTS "User_Attribute" (
-    "UserId" VARCHAR(100), 
-    "AttributeKey" VARCHAR(50), 
-    "AttributeValue" VARCHAR(100), 
-    PRIMARY KEY ("UserId", "AttributeKey", "AttributeValue")
-);
-
-CREATE TABLE IF NOT EXISTS "User_Role" (
+CREATE TABLE IF NOT EXISTS "User_Claim" (
+    "Id" SERIAL PRIMARY KEY,
     "UserId" VARCHAR(100),
-    "RoleName" VARCHAR(50) REFERENCES "Role"("RoleName"),
-    PRIMARY KEY ("UserId", "RoleName")
+    "ClaimType" VARCHAR(50),    
+    "ClaimValue" VARCHAR(100),  
+    "AuditSource" VARCHAR(50),
+    "AuditReason" TEXT,
+    "GrantedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE ("UserId", "ClaimType", "ClaimValue")
 );
+```
+
+And based upon it we'll create a view with the Effective Claims of a given user, 
+which is the . Let's add a lineage for auditing, so we know where the Claim 
+originally came from.
+
+```csharp
+-- ============================================================================
+-- EFFECTIVE CLAIMS VIEW
+-- ============================================================================
+CREATE OR REPLACE VIEW "vw_Effective_Claims" AS
+    -- Direct Claims (Overrides, Departments, Base Roles)
+    SELECT 
+        "UserId", 
+        "ClaimType", 
+        "ClaimValue",
+        "AuditSource" AS "Lineage",
+        "AuditReason" AS "Reason"
+    FROM "User_Claim"
+    
+    UNION ALL
+    
+    -- Inherited Permissions
+    SELECT 
+        uc."UserId", 
+        'Permission' AS "ClaimType", 
+        rp."Permission" AS "ClaimValue",
+        'Inherited via Role: ' || uc."ClaimValue" AS "Lineage", 
+        uc."AuditReason" AS "Reason"
+    FROM "User_Claim" uc
+    JOIN "Role_Permission" rp ON rp."RoleName" = uc."ClaimValue"
+    WHERE uc."ClaimType" = 'Role';
 ```
 
 ### Defining Helper Functions to check for permissions
 
-Next we'll define 3 Helper functions to avoid repetitive SQL Queries. By marking them as 
-`STABLE` they are very efficient and optimized:
+Next we'll define 4 Helper functions to avoid repetitive SQL Queries. 
+
+By marking them as `STABLE PARALLEL SAFE` they are very efficient and optimized:
 
 ```sql
-CREATE OR REPLACE FUNCTION has_permission(p_permission VARCHAR) 
-RETURNS BOOLEAN 
-LANGUAGE sql STABLE 
-AS $$
+CREATE OR REPLACE FUNCTION has_claim(p_type VARCHAR, p_value VARCHAR) 
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
     SELECT EXISTS (
-        SELECT 1
-        FROM "User_Role" ur
-        JOIN "Role_Permission" rp ON rp."RoleName" = ur."RoleName"
-        WHERE ur."UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
-          AND rp."Permission" = p_permission
+        SELECT 1 FROM "vw_Effective_Claims" 
+        WHERE "UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
+          AND "ClaimType" = p_type 
+          AND "ClaimValue" = p_value
     );
+$$;
+
+CREATE OR REPLACE FUNCTION has_permission(p_permission VARCHAR) 
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT has_claim('Permission', p_permission);
 $$;
 
 CREATE OR REPLACE FUNCTION has_department_access(p_department VARCHAR) 
-RETURNS BOOLEAN 
-LANGUAGE sql STABLE 
-AS $$
-    SELECT EXISTS (
-        SELECT 1
-        FROM "User_Attribute" ua
-        WHERE ua."UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
-          AND ua."AttributeKey" = 'Department'
-          AND (ua."AttributeValue" = '*' OR ua."AttributeValue" = p_department)
-    );
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT has_claim('Department', '*') OR has_claim('Department', p_department);
 $$;
 
 CREATE OR REPLACE FUNCTION mask_if_not(val anyelement, condition boolean) 
-RETURNS anyelement 
-LANGUAGE sql IMMUTABLE 
-AS $$
+RETURNS anyelement LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     SELECT CASE WHEN condition THEN val ELSE NULL END;
 $$;
 ```
@@ -407,27 +428,44 @@ We can then seed the database with some sample data:
 
 ```sql
 INSERT INTO "Role" ("RoleName", "Description") VALUES 
-    ('Standard_User', 'Normal Employee'),
-    ('HR_Manager', 'Human Resources Manager')
+('Standard_User', 'Normal Employee'),
+('HR_Manager', 'Human Resources Manager')
 ON CONFLICT ("RoleName") DO NOTHING;
 
 INSERT INTO "Role_Permission" ("RoleName", "Permission") VALUES 
-    ('Standard_User', 'Employee:Read_Public'),
-    ('HR_Manager', 'Employee:Read_Public'),
-    ('HR_Manager', 'Salary:Read')
+('Standard_User', 'Employee:Read_Public'),
+('HR_Manager', 'Employee:Read_Public'),
+('HR_Manager', 'Salary:Read')
 ON CONFLICT ("RoleName", "Permission") DO NOTHING;
 
-INSERT INTO "User_Attribute" ("UserId", "AttributeKey", "AttributeValue") VALUES 
-    ('jane.smith@firma.de', 'Department', 'IT'),
-    ('john.doe@firma.de', 'Department', 'Sales'),
-    ('hr.boss@firma.de', 'Department', '*')
-ON CONFLICT ("UserId", "AttributeKey", "AttributeValue") DO NOTHING;
+-- Insert roles and attributes as unified claims with audit data
+INSERT INTO "User_Claim" ("UserId", "ClaimType", "ClaimValue", "AuditSource", "AuditReason") VALUES 
+-- Jane Smith (Standard User in IT)
+('jane.smith@firma.de', 'Department', 'IT', 'System_Init', 'Initial Setup'),
+('jane.smith@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
 
-INSERT INTO "User_Role" ("UserId", "RoleName") VALUES 
-    ('jane.smith@firma.de', 'Standard_User'),
-    ('john.doe@firma.de', 'Standard_User'),
-    ('hr.boss@firma.de', 'HR_Manager')
-ON CONFLICT ("UserId", "RoleName") DO NOTHING;
+-- John Doe (Standard User in Sales)
+('john.doe@firma.de', 'Department', 'Sales', 'System_Init', 'Initial Setup'),
+('john.doe@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+
+-- HR Boss (HR Manager with Global access)
+('hr.boss@firma.de', 'Department', '*', 'System_Init', 'Initial Setup'),
+('hr.boss@firma.de', 'Role', 'HR_Manager', 'System_Init', 'Initial Setup')
+ON CONFLICT ("UserId", "ClaimType", "ClaimValue") DO NOTHING;
+
+INSERT INTO "Employee" ("Id", "Name", "Department", "AnnualSalary", "BonusGoal") VALUES 
+(1, 'Jane Smith', 'IT', 82000, 'System Uptime'),
+(2, 'John Doe', 'Sales', 65000, '10% Sales Increase')
+ON CONFLICT ("Id") DO NOTHING;
+
+SELECT setval(pg_get_serial_sequence('"Employee"', 'Id'), coalesce(max("Id"), 1), max("Id") IS NOT null) FROM "Employee";
+
+INSERT INTO "BonusPayment" ("Id", "EmployeeId", "Amount", "Reason") VALUES 
+(1, 1, 5000.00, 'Excellent Uptime'),
+(2, 2, 3000.00, 'Q1 Target Met')
+ON CONFLICT ("Id") DO NOTHING;
+
+SELECT setval(pg_get_serial_sequence('"BonusPayment"', 'Id'), coalesce(max("Id"), 1), max("Id") IS NOT null) FROM "BonusPayment";
 ```
 
 Now here is the trick: Never expose physical tables to the application. Always expose Views.
@@ -472,14 +510,13 @@ SELECT
     bp."Id",
     bp."EmployeeId",
     
-    -- FIELD-LEVEL SECURITY: Only visible if the user has Salary:Read AND department access to the parent Employee
+    -- FIELD-LEVEL SECURITY
     mask_if_not(bp."Amount", has_permission('Salary:Read') AND has_department_access(e."Department")),
     mask_if_not(bp."Reason", has_permission('Salary:Read') AND has_department_access(e."Department"))
 
 FROM "BonusPayment" bp
 JOIN "Employee" e ON bp."EmployeeId" = e."Id"
--- ROW-LEVEL SECURITY: Bonus payments are completely filtered out if the user
--- does not have the "Salary:Read" permission OR lacks access to the employee's department.
+-- ROW-LEVEL SECURITY
 WHERE has_permission('Salary:Read') AND has_department_access(e."Department");
 ```
 
@@ -512,8 +549,8 @@ GRANT SELECT ON "vw_BonusPayment_Secure" TO app_user;
 -- are executed in the context of the invoker (SECURITY INVOKER by default).
 GRANT SELECT ON "Role" TO app_user;
 GRANT SELECT ON "Role_Permission" TO app_user;
-GRANT SELECT ON "User_Attribute" TO app_user;
-GRANT SELECT ON "User_Role" TO app_user;
+GRANT SELECT ON "User_Claim" TO app_user;
+GRANT SELECT ON "vw_Effective_Claims" TO app_user;
 ```
 
 ## SQL Server Database ##
@@ -523,10 +560,10 @@ GRANT SELECT ON "User_Role" TO app_user;
 Start by mapping organizational roles to technical permissions and attributes directly in the database.
 
 ```sql
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role]') AND type in (N'U'))
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role_Permission]') AND type in (N'U'))
 BEGIN
     CREATE TABLE [dbo].[Role] (
-        [RoleName] NVARCHAR(50) PRIMARY KEY,
+        [RoleName] VARCHAR(50) PRIMARY KEY,
         [Description] NVARCHAR(MAX)
     );
 END
@@ -534,30 +571,54 @@ END
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role_Permission]') AND type in (N'U'))
 BEGIN
     CREATE TABLE [dbo].[Role_Permission] (
-        [RoleName] NVARCHAR(50) FOREIGN KEY REFERENCES [dbo].[Role]([RoleName]),
-        [Permission] NVARCHAR(100),
-        PRIMARY KEY ([RoleName], [Permission])
+        [RoleName] VARCHAR(50) REFERENCES Role(RoleName),
+        [Permission] VARCHAR(100),
+        PRIMARY KEY (RoleName, Permission)
     );
 END
 
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Role]') AND type in (N'U'))
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Claim]') AND type in (N'U'))
 BEGIN
-    CREATE TABLE [dbo].[User_Role] (
-        [UserId] NVARCHAR(100),
-        [RoleName] NVARCHAR(50) FOREIGN KEY REFERENCES [dbo].[Role]([RoleName]),
-        PRIMARY KEY ([UserId], [RoleName])
+    CREATE TABLE [dbo].[User_Claim] (
+        [Id] INT IDENTITY(1,1) PRIMARY KEY,
+        [UserId] VARCHAR(100),
+        [ClaimType] VARCHAR(50),    -- 'Role', 'Department', 'Permission'
+        [ClaimValue] VARCHAR(100),  
+        [AuditSource] VARCHAR(50),  -- e.g., 'System_Init', 'AzureAD'
+        [AuditReason] NVARCHAR(MAX),
+        [GrantedAt] DATETIME2 DEFAULT SYSDATETIME(),
+        UNIQUE (UserId, ClaimType, ClaimValue)
     );
 END
+```
 
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Attribute]') AND type in (N'U'))
-BEGIN
-    CREATE TABLE [dbo].[User_Attribute] (
-        [UserId] NVARCHAR(100), 
-        [AttributeKey] NVARCHAR(50), 
-        [AttributeValue] NVARCHAR(100), 
-        PRIMARY KEY ([UserId], [AttributeKey], [AttributeValue])
-    );
-END
+And based upon it we'll create a view with the Effective Claims of a given user, 
+which is the . Let's add a lineage for auditing, so we know where the Claim 
+originally came from.
+
+```sql
+CREATE OR ALTER VIEW vw_Effective_Claims AS
+    -- Direct Claims (Overrides, Departments, Base Roles)
+    SELECT 
+        UserId, 
+        ClaimType, 
+        ClaimValue,
+        AuditSource AS Lineage,
+        AuditReason AS Reason
+    FROM User_Claim
+    
+    UNION ALL
+    
+    -- Inherited Permissions (Exploding the Roles)
+    SELECT 
+        uc.UserId, 
+        'Permission' AS ClaimType, 
+        rp.Permission AS ClaimValue,
+        'Inherited via Role: ' + uc.ClaimValue AS Lineage, 
+        uc.AuditReason AS Reason
+    FROM User_Claim uc
+    JOIN Role_Permission rp ON rp.RoleName = uc.ClaimValue
+    WHERE uc.ClaimType = 'Role';
 
 GO
 ```
@@ -569,63 +630,39 @@ of attributes to access a row or field. It looks a bit more verbose, than Postgr
 it's still a nice implementation.
 
 ```sql
--- Check if the current session user has a specific permission
-CREATE OR ALTER FUNCTION [dbo].[fn_HasPermission] (@Permission NVARCHAR(100))
+CREATE OR ALTER FUNCTION dbo.has_claim(@p_type VARCHAR(50), @p_value VARCHAR(100))
 RETURNS BIT
 AS
 BEGIN
-    DECLARE @CurrentUserId NVARCHAR(100) = CAST(SESSION_CONTEXT(N'app.current_user') AS NVARCHAR(100));
-    
-    IF EXISTS (
-        SELECT 1 FROM [dbo].[User_Role] ur
-        JOIN [dbo].[Role_Permission] rp ON rp.[RoleName] = ur.[RoleName]
-        WHERE ur.[UserId] = ISNULL(@CurrentUserId, 'anonymous')
-          AND rp.[Permission] = @Permission
-    )
-        RETURN 1;
-
-    RETURN 0;
+    RETURN (
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM vw_Effective_Claims 
+            WHERE UserId = ISNULL(CAST(SESSION_CONTEXT(N'app.current_user') AS VARCHAR(100)), 'anonymous')
+              AND ClaimType = @p_type 
+              AND ClaimValue = @p_value
+        ) THEN 1 ELSE 0 END
+    );
 END;
 GO
 
-
--- Check if the current session user has a matching attribute (supports wildcards)
-CREATE OR ALTER FUNCTION [dbo].[fn_HasAttrAccess] (@Key NVARCHAR(50), @Val NVARCHAR(100))
+CREATE OR ALTER FUNCTION dbo.has_permission(@p_permission VARCHAR(100))
 RETURNS BIT
 AS
 BEGIN
-    DECLARE @CurrentUserId NVARCHAR(100) = CAST(SESSION_CONTEXT(N'app.current_user') AS NVARCHAR(100));
-    
-    IF EXISTS (
-        SELECT 1 FROM [dbo].[User_Attribute] ua
-        WHERE ua.[UserId] = ISNULL(@CurrentUserId, 'anonymous')
-          AND ua.[AttributeKey] = @Key
-          AND (ua.[AttributeValue] = @Val OR ua.[AttributeValue] = '*')
-    )
-        RETURN 1;
-
-    RETURN 0;
+    RETURN dbo.has_claim('Permission', @p_permission);
 END;
 GO
 
--- Checks if a user is authorized based on a permission and optional attribute
-CREATE OR ALTER FUNCTION [dbo].[fn_Auth] (
-    @Permission NVARCHAR(100),
-    @AttrKey    NVARCHAR(50) = NULL,
-    @AttrValue  NVARCHAR(100) = NULL
-)
+CREATE OR ALTER FUNCTION dbo.has_department_access(@p_department VARCHAR(100))
 RETURNS BIT
 AS
 BEGIN
-    -- 1. Must have the base permission
-    IF [dbo].[fn_HasPermission](@Permission) = 0
-        RETURN 0;
-
-    -- 2. If an attribute check is requested, must have matching attribute
-    IF @AttrKey IS NOT NULL AND [dbo].[fn_HasAttrAccess](@AttrKey, @AttrValue) = 0
-        RETURN 0;
-
-    RETURN 1;
+    RETURN (
+        SELECT CASE WHEN 
+            dbo.has_claim('Department', '*') = 1 OR 
+            dbo.has_claim('Department', @p_department) = 1 
+        THEN 1 ELSE 0 END
+    );
 END;
 GO
 ```
@@ -639,87 +676,66 @@ payments for an employee.
 Only the Boss of HR is allowed to read the salary and see bonus payments.
 
 ```sql
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Employee]') AND type in (N'U'))
-BEGIN
-CREATE TABLE [dbo].[Employee] (
-    [Id] INT IDENTITY(1,1) PRIMARY KEY,
-    [Name] NVARCHAR(200) NOT NULL,
-    [Department] NVARCHAR(100) NOT NULL,
-    [AnnualSalary] DECIMAL(18, 2),
-    [BonusGoal] NVARCHAR(2000),
-    [Region] NVARCHAR(50) 
+CREATE TABLE IF NOT EXISTS "Employee" (
+    "Id" SERIAL PRIMARY KEY,
+    "Name" VARCHAR(200) NOT NULL,
+    "Department" VARCHAR(100) NOT NULL,
+    "AnnualSalary" DECIMAL(10,2),
+    "BonusGoal" TEXT
 );
-END
 
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[BonusPayment]') AND type in (N'U'))
-BEGIN
-    CREATE TABLE [dbo].[BonusPayment] (
-        [Id] INT IDENTITY(1,1) PRIMARY KEY,
-        [EmployeeId] INT NOT NULL FOREIGN KEY REFERENCES [dbo].[Employee]([Id]),
-        [Amount] DECIMAL(18, 2) NOT NULL,
-        [Reason] NVARCHAR(2000)
-    );
-END
-GO
+CREATE TABLE IF NOT EXISTS "BonusPayment" (
+    "Id" SERIAL PRIMARY KEY,
+    "EmployeeId" INTEGER NOT NULL REFERENCES "Employee"("Id"),
+    "Amount" DECIMAL(10,2) NOT NULL,
+    "Reason" TEXT
+);
 ```
 
 We can then seed the database with some sample data:
 
 ```sql
--- Roles
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Role] WHERE [RoleName] = 'Standard_User')
-BEGIN
-    INSERT INTO [dbo].[Role] ([RoleName], [Description]) VALUES 
-    ('Standard_User', 'Normal Employee'),
-    ('HR_Manager', 'Human Resources Manager');
-END
+IF NOT EXISTS (SELECT 1 FROM Role WHERE RoleName = 'Standard_User')
+    INSERT INTO Role (RoleName, Description) VALUES ('Standard_User', 'Normal Employee');
 
--- Permissions
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Role_Permission] WHERE [RoleName] = 'Standard_User' AND [Permission] = 'Employee:Read_Public')
-BEGIN
-    INSERT INTO [dbo].[Role_Permission] ([RoleName], [Permission]) VALUES 
-    ('Standard_User', 'Employee:Read_Public'),
+IF NOT EXISTS (SELECT 1 FROM Role WHERE RoleName = 'HR_Manager')
+    INSERT INTO Role (RoleName, Description) VALUES ('HR_Manager', 'Human Resources Manager');
+
+IF NOT EXISTS (SELECT 1 FROM Role_Permission WHERE RoleName = 'Standard_User')
+    INSERT INTO Role_Permission (RoleName, Permission) VALUES ('Standard_User', 'Employee:Read_Public');
+
+IF NOT EXISTS (SELECT 1 FROM Role_Permission WHERE RoleName = 'HR_Manager')
+    INSERT INTO Role_Permission (RoleName, Permission) VALUES 
     ('HR_Manager', 'Employee:Read_Public'),
     ('HR_Manager', 'Salary:Read');
-END
 
--- User Attributes (for the Department context)
-IF NOT EXISTS (SELECT 1 FROM [dbo].[User_Attribute] WHERE [UserId] = 'jane.smith@firma.de')
+-- Insert claims (Roles and Departments)
+IF NOT EXISTS (SELECT 1 FROM User_Claim WHERE UserId = 'jane.smith@firma.de')
 BEGIN
-    INSERT INTO [dbo].[User_Attribute] ([UserId], [AttributeKey], [AttributeValue]) VALUES 
-    ('jane.smith@firma.de', 'Department', 'IT'),
-    ('john.doe@firma.de', 'Department', 'Sales'),
-    ('hr.boss@firma.de', 'Department', '*');
-END
+    INSERT INTO User_Claim (UserId, ClaimType, ClaimValue, AuditSource, AuditReason) VALUES 
+    ('jane.smith@firma.de', 'Department', 'IT', 'System_Init', 'Initial Setup'),
+    ('jane.smith@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+    ('john.doe@firma.de', 'Department', 'Sales', 'System_Init', 'Initial Setup'),
+    ('john.doe@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+    ('hr.boss@firma.de', 'Department', '*', 'System_Init', 'Initial Setup'),
+    ('hr.boss@firma.de', 'Role', 'HR_Manager', 'System_Init', 'Initial Setup');
+END;
 
--- User Roles
-IF NOT EXISTS (SELECT 1 FROM [dbo].[User_Role] WHERE [UserId] = 'jane.smith@firma.de')
-BEGIN
-    INSERT INTO [dbo].[User_Role] ([UserId], [RoleName]) VALUES 
-    ('jane.smith@firma.de', 'Standard_User'),
-    ('john.doe@firma.de', 'Standard_User'),
-    ('hr.boss@firma.de', 'HR_Manager');
-END
+-- Explicitly inserting IDs requires turning on IDENTITY_INSERT
+SET IDENTITY_INSERT Employee ON;
+IF NOT EXISTS (SELECT 1 FROM Employee WHERE Id = 1)
+    INSERT INTO Employee (Id, Name, Department, AnnualSalary, BonusGoal) VALUES 
+    (1, 'Jane Smith', 'IT', 82000, 'System Uptime'),
+    (2, 'John Doe', 'Sales', 65000, '10% Sales Increase');
+SET IDENTITY_INSERT Employee OFF;
 
--- Employees
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Employee] WHERE [Id] IN (1, 2))
-BEGIN
-    SET IDENTITY_INSERT [dbo].[Employee] ON;
-    INSERT INTO [dbo].[Employee] ([Id], [Name], [Department], [AnnualSalary], [BonusGoal], [Region]) VALUES 
-    (1, 'Jane Smith', 'IT', 82000, 'System Uptime', 'North'),
-    (2, 'John Doe', 'Sales', 65000, '10% Sales Increase', 'South');
-    SET IDENTITY_INSERT [dbo].[Employee] OFF;
-END
-
--- Bonus Payments
-IF NOT EXISTS (SELECT 1 FROM [dbo].[BonusPayment] WHERE [Id] IN (1, 2))
-BEGIN
-    SET IDENTITY_INSERT [dbo].[BonusPayment] ON;
-    INSERT INTO [dbo].[BonusPayment] ([Id], [EmployeeId], [Amount], [Reason]) VALUES 
+SET IDENTITY_INSERT BonusPayment ON;
+IF NOT EXISTS (SELECT 1 FROM BonusPayment WHERE Id = 1)
+    INSERT INTO BonusPayment (Id, EmployeeId, Amount, Reason) VALUES 
     (1, 1, 5000.00, 'Excellent Uptime'),
     (2, 2, 3000.00, 'Q1 Target Met');
-    SET IDENTITY_INSERT [dbo].[BonusPayment] OFF;
-END
+SET IDENTITY_INSERT BonusPayment OFF;
+
 GO
 ```
 
@@ -731,23 +747,24 @@ salary and bonus goal.
 
 ```sql
 -- Secure view for Employees
-CREATE OR ALTER VIEW [dbo].[vw_Employee_Secure]
-AS
+
+CREATE OR ALTER VIEW vw_Employee_Secure AS 
 SELECT 
-    e.[Id], 
-    e.[Name], 
-    e.[Department],
+    e.Id, 
+    e.Name, 
+    e.Department,
     
     -- FIELD-LEVEL SECURITY
-    -- Mask AnnualSalary if lacks Salary:Read OR lack Department access
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, e.[AnnualSalary], NULL) AS [AnnualSalary],
-    
-    -- Mask BonusGoal based on base permission
-    IIF([dbo].[fn_Auth]('Salary:Read', NULL, NULL) = 1, e.[BonusGoal], NULL) AS [BonusGoal]
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN e.AnnualSalary ELSE NULL END AS AnnualSalary,
+         
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 
+         THEN e.BonusGoal ELSE NULL END AS BonusGoal
 
-FROM [dbo].[Employee] e
+FROM Employee e
 -- ROW-LEVEL SECURITY
-WHERE [dbo].[fn_Auth]('Employee:Read_Public', NULL, NULL) = 1;
+WHERE dbo.has_permission('Employee:Read_Public') = 1;
+
 GO
 ```
 
@@ -756,20 +773,25 @@ payments, if you have the permission `Salary:Read` and you are the departments b
 
 ```sql
 -- Secure view for Bonus Payments with relationship security
-CREATE OR ALTER VIEW [dbo].[vw_BonusPayment_Secure]
-AS
-SELECT
-    bp.[Id],
-    bp.[EmployeeId],
-    
-    -- FIELD-LEVEL SECURITY: Only visible if user has Salary:Read AND access to parent Employee's department
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, bp.[Amount], NULL) AS [Amount],
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, bp.[Reason], NULL) AS [Reason]
 
-FROM [dbo].[BonusPayment] bp
-JOIN [dbo].[Employee] e ON bp.[EmployeeId] = e.[Id]
--- ROW-LEVEL SECURITY: Bonus payments are filtered out if lacks Salary:Read OR lacks access to the employee's department.
-WHERE [dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1;
+CREATE OR ALTER VIEW vw_BonusPayment_Secure AS
+SELECT
+    bp.Id,
+    bp.EmployeeId,
+    
+    -- FIELD-LEVEL SECURITY
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN bp.Amount ELSE NULL END AS Amount,
+         
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN bp.Reason ELSE NULL END AS Reason
+
+FROM BonusPayment bp
+JOIN Employee e ON bp.EmployeeId = e.Id
+-- ROW-LEVEL SECURITY
+WHERE dbo.has_permission('Salary:Read') = 1 
+  AND dbo.has_department_access(e.Department) = 1;
+
 GO
 ```
 
@@ -791,25 +813,20 @@ BEGIN
 END
 GO
 
--- Grant EXECUTE on the security functions so the views can evaluate them
-GRANT EXECUTE ON [dbo].[fn_HasPermission] TO [ODataApiUser];
-GRANT EXECUTE ON [dbo].[fn_HasAttrAccess] TO [ODataApiUser];
-GRANT EXECUTE ON [dbo].[fn_Auth] TO [ODataApiUser];
+-- Grant explicit SELECT access ONLY to the secure views
+GRANT SELECT ON vw_Employee_Secure TO [ODataApiUser];
+GRANT SELECT ON vw_BonusPayment_Secure TO [ODataApiUser];
 
--- Grant SELECT ONLY on the secure views
-GRANT SELECT ON [dbo].[vw_Employee_Secure] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[vw_BonusPayment_Secure] TO [ODataApiUser];
+-- Grant execution rights to the functions so the views can use them
+GRANT EXECUTE ON dbo.has_claim TO [ODataApiUser];
+GRANT EXECUTE ON dbo.has_permission TO [ODataApiUser];
+GRANT EXECUTE ON dbo.has_department_access TO [ODataApiUser];
 
--- Explicitly ensure NO access to the raw tables
-DENY SELECT ON [dbo].[Employee] TO [ODataApiUser];
-DENY SELECT ON [dbo].[BonusPayment] TO [ODataApiUser];
-
--- Grant SELECT on metadata tables required for the functions to work
-GRANT SELECT ON [dbo].[Role] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[Role_Permission] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[User_Role] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[User_Attribute] TO [ODataApiUser];
-GO
+-- Grant read access to the metadata tables and views
+GRANT SELECT ON Role TO [ODataApiUser];
+GRANT SELECT ON Role_Permission TO [ODataApiUser];
+GRANT SELECT ON User_Claim TO [ODataApiUser];
+GRANT SELECT ON vw_Effective_Claims TO [ODataApiUser];
 ```
 
 ## Docker Compose Files
@@ -1064,6 +1081,6 @@ the rules. Your data is protected at its core, and it doesn't matter which appli
 safe wether it's OData, or an ORM.
 
 While everything looks nice for this simple example, it's probably getting hairy as soon as the requirements 
-and rules get more complex. I will see how it turns to work out in larger projects and adjust.
+and rules get more complex. I will see how it turns out to work in larger projects and then adjust.
 
-Anyways, I think it's a good start for a flexible authorization implementation.
+Anyways, I think it's a good start towards a flexible authorization implementation!
