@@ -12,17 +12,15 @@ CREATE TABLE IF NOT EXISTS "Role_Permission" (
     PRIMARY KEY ("RoleName", "Permission")
 );
 
-CREATE TABLE IF NOT EXISTS "User_Attribute" (
-    "UserId" VARCHAR(100), 
-    "AttributeKey" VARCHAR(50), 
-    "AttributeValue" VARCHAR(100), 
-    PRIMARY KEY ("UserId", "AttributeKey", "AttributeValue")
-);
-
-CREATE TABLE IF NOT EXISTS "User_Role" (
+CREATE TABLE IF NOT EXISTS "User_Claim" (
+    "Id" SERIAL PRIMARY KEY,
     "UserId" VARCHAR(100),
-    "RoleName" VARCHAR(50) REFERENCES "Role"("RoleName"),
-    PRIMARY KEY ("UserId", "RoleName")
+    "ClaimType" VARCHAR(50),    
+    "ClaimValue" VARCHAR(100),  
+    "AuditSource" VARCHAR(50),
+    "AuditReason" TEXT,
+    "GrantedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE ("UserId", "ClaimType", "ClaimValue")
 );
 
 CREATE TABLE IF NOT EXISTS "Employee" (
@@ -55,24 +53,26 @@ INSERT INTO "Role_Permission" ("RoleName", "Permission") VALUES
 ('HR_Manager', 'Salary:Read')
 ON CONFLICT ("RoleName", "Permission") DO NOTHING;
 
-INSERT INTO "User_Attribute" ("UserId", "AttributeKey", "AttributeValue") VALUES 
-('jane.smith@firma.de', 'Department', 'IT'),
-('john.doe@firma.de', 'Department', 'Sales'),
-('hr.boss@firma.de', 'Department', '*')
-ON CONFLICT ("UserId", "AttributeKey", "AttributeValue") DO NOTHING;
+-- Insert roles and attributes as unified claims with audit data
+INSERT INTO "User_Claim" ("UserId", "ClaimType", "ClaimValue", "AuditSource", "AuditReason") VALUES 
+-- Jane Smith (Standard User in IT)
+('jane.smith@firma.de', 'Department', 'IT', 'System_Init', 'Initial Setup'),
+('jane.smith@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
 
-INSERT INTO "User_Role" ("UserId", "RoleName") VALUES 
-('jane.smith@firma.de', 'Standard_User'),
-('john.doe@firma.de', 'Standard_User'),
-('hr.boss@firma.de', 'HR_Manager')
-ON CONFLICT ("UserId", "RoleName") DO NOTHING;
+-- John Doe (Standard User in Sales)
+('john.doe@firma.de', 'Department', 'Sales', 'System_Init', 'Initial Setup'),
+('john.doe@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+
+-- HR Boss (HR Manager with Global access)
+('hr.boss@firma.de', 'Department', '*', 'System_Init', 'Initial Setup'),
+('hr.boss@firma.de', 'Role', 'HR_Manager', 'System_Init', 'Initial Setup')
+ON CONFLICT ("UserId", "ClaimType", "ClaimValue") DO NOTHING;
 
 INSERT INTO "Employee" ("Id", "Name", "Department", "AnnualSalary", "BonusGoal") VALUES 
 (1, 'Jane Smith', 'IT', 82000, 'System Uptime'),
 (2, 'John Doe', 'Sales', 65000, '10% Sales Increase')
 ON CONFLICT ("Id") DO NOTHING;
 
--- Set the sequence to the highest value in case we hardcoded inserted IDs
 SELECT setval(pg_get_serial_sequence('"Employee"', 'Id'), coalesce(max("Id"), 1), max("Id") IS NOT null) FROM "Employee";
 
 INSERT INTO "BonusPayment" ("Id", "EmployeeId", "Amount", "Reason") VALUES 
@@ -80,47 +80,61 @@ INSERT INTO "BonusPayment" ("Id", "EmployeeId", "Amount", "Reason") VALUES
 (2, 2, 3000.00, 'Q1 Target Met')
 ON CONFLICT ("Id") DO NOTHING;
 
--- Set the sequence to the highest value in case we hardcoded inserted IDs
 SELECT setval(pg_get_serial_sequence('"BonusPayment"', 'Id'), coalesce(max("Id"), 1), max("Id") IS NOT null) FROM "BonusPayment";
 
+-- ============================================================================
+-- EFFECTIVE CLAIMS VIEW
+-- ============================================================================
+CREATE OR REPLACE VIEW "vw_Effective_Claims" AS
+    -- Direct Claims (Overrides, Departments, Base Roles)
+    SELECT 
+        "UserId", 
+        "ClaimType", 
+        "ClaimValue",
+        "AuditSource" AS "Lineage",
+        "AuditReason" AS "Reason"
+    FROM "User_Claim"
+    
+    UNION ALL
+    
+    -- Inherited Permissions
+    SELECT 
+        uc."UserId", 
+        'Permission' AS "ClaimType", 
+        rp."Permission" AS "ClaimValue",
+        'Inherited via Role: ' || uc."ClaimValue" AS "Lineage", 
+        uc."AuditReason" AS "Reason"
+    FROM "User_Claim" uc
+    JOIN "Role_Permission" rp ON rp."RoleName" = uc."ClaimValue"
+    WHERE uc."ClaimType" = 'Role';
 
 -- ============================================================================
 -- HELPER FUNCTIONS
 -- ============================================================================
+CREATE OR REPLACE FUNCTION has_claim(p_type VARCHAR, p_value VARCHAR) 
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM "vw_Effective_Claims" 
+        WHERE "UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
+          AND "ClaimType" = p_type 
+          AND "ClaimValue" = p_value
+    );
+$$;
 
 CREATE OR REPLACE FUNCTION has_permission(p_permission VARCHAR) 
-RETURNS BOOLEAN 
-LANGUAGE sql STABLE 
-AS $$
-    SELECT EXISTS (
-        SELECT 1
-        FROM "User_Role" ur
-        JOIN "Role_Permission" rp ON rp."RoleName" = ur."RoleName"
-        WHERE ur."UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
-          AND rp."Permission" = p_permission
-    );
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT has_claim('Permission', p_permission);
 $$;
 
 CREATE OR REPLACE FUNCTION has_department_access(p_department VARCHAR) 
-RETURNS BOOLEAN 
-LANGUAGE sql STABLE 
-AS $$
-    SELECT EXISTS (
-        SELECT 1
-        FROM "User_Attribute" ua
-        WHERE ua."UserId" = COALESCE(current_setting('app.current_user', true), 'anonymous')
-          AND ua."AttributeKey" = 'Department'
-          AND (ua."AttributeValue" = '*' OR ua."AttributeValue" = p_department)
-    );
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT has_claim('Department', '*') OR has_claim('Department', p_department);
 $$;
 
 CREATE OR REPLACE FUNCTION mask_if_not(val anyelement, condition boolean) 
-RETURNS anyelement 
-LANGUAGE sql IMMUTABLE 
-AS $$
+RETURNS anyelement LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     SELECT CASE WHEN condition THEN val ELSE NULL END;
 $$;
-
 
 -- ============================================================================
 -- THE SECURE VIEW FOR EF CORE (Anti-Corruption Layer)
@@ -145,7 +159,6 @@ FROM "Employee" e
 -- ROW-LEVEL SECURITY
 WHERE has_permission('Employee:Read_Public');
 
--- The secure view for Bonus Payments, demonstrating relationship security
 CREATE OR REPLACE VIEW "vw_BonusPayment_Secure" (
     "Id",
     "EmployeeId",
@@ -156,14 +169,13 @@ SELECT
     bp."Id",
     bp."EmployeeId",
     
-    -- FIELD-LEVEL SECURITY: Only visible if the user has Salary:Read AND department access to the parent Employee
+    -- FIELD-LEVEL SECURITY
     mask_if_not(bp."Amount", has_permission('Salary:Read') AND has_department_access(e."Department")),
     mask_if_not(bp."Reason", has_permission('Salary:Read') AND has_department_access(e."Department"))
 
 FROM "BonusPayment" bp
 JOIN "Employee" e ON bp."EmployeeId" = e."Id"
--- ROW-LEVEL SECURITY: Bonus payments are completely filtered out if the user
--- does not have the "Salary:Read" permission OR lacks access to the employee's department.
+-- ROW-LEVEL SECURITY
 WHERE has_permission('Salary:Read') AND has_department_access(e."Department");
 
 
@@ -195,5 +207,5 @@ GRANT SELECT ON "vw_BonusPayment_Secure" TO app_user;
 -- are executed in the context of the invoker (SECURITY INVOKER by default).
 GRANT SELECT ON "Role" TO app_user;
 GRANT SELECT ON "Role_Permission" TO app_user;
-GRANT SELECT ON "User_Attribute" TO app_user;
-GRANT SELECT ON "User_Role" TO app_user;
+GRANT SELECT ON "User_Claim" TO app_user;
+GRANT SELECT ON "vw_Effective_Claims" TO app_user;

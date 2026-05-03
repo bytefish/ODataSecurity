@@ -1,6 +1,7 @@
 -- ======================================================
 -- CREATE THE DATABASE
 -- ======================================================
+
 USE [master];
 GO
 
@@ -14,12 +15,13 @@ USE [ODataSecurityDemo];
 GO
 
 -- ======================================================
--- ABAC META-SCHEMA
+-- TABLES
 -- ======================================================
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role]') AND type in (N'U'))
+
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role_Permission]') AND type in (N'U'))
 BEGIN
     CREATE TABLE [dbo].[Role] (
-        [RoleName] NVARCHAR(50) PRIMARY KEY,
+        [RoleName] VARCHAR(50) PRIMARY KEY,
         [Description] NVARCHAR(MAX)
     );
 END
@@ -27,99 +29,26 @@ END
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Role_Permission]') AND type in (N'U'))
 BEGIN
     CREATE TABLE [dbo].[Role_Permission] (
-        [RoleName] NVARCHAR(50) FOREIGN KEY REFERENCES [dbo].[Role]([RoleName]),
-        [Permission] NVARCHAR(100),
-        PRIMARY KEY ([RoleName], [Permission])
+        [RoleName] VARCHAR(50) REFERENCES Role(RoleName),
+        [Permission] VARCHAR(100),
+        PRIMARY KEY (RoleName, Permission)
     );
 END
 
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Role]') AND type in (N'U'))
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Claim]') AND type in (N'U'))
 BEGIN
-    CREATE TABLE [dbo].[User_Role] (
-        [UserId] NVARCHAR(100),
-        [RoleName] NVARCHAR(50) FOREIGN KEY REFERENCES [dbo].[Role]([RoleName]),
-        PRIMARY KEY ([UserId], [RoleName])
+    CREATE TABLE [dbo].[User_Claim] (
+        [Id] INT IDENTITY(1,1) PRIMARY KEY,
+        [UserId] VARCHAR(100),
+        [ClaimType] VARCHAR(50),    -- 'Role', 'Department', 'Permission'
+        [ClaimValue] VARCHAR(100),  
+        [AuditSource] VARCHAR(50),  -- e.g., 'System_Init', 'AzureAD'
+        [AuditReason] NVARCHAR(MAX),
+        [GrantedAt] DATETIME2 DEFAULT SYSDATETIME(),
+        UNIQUE (UserId, ClaimType, ClaimValue)
     );
 END
 
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[User_Attribute]') AND type in (N'U'))
-BEGIN
-    CREATE TABLE [dbo].[User_Attribute] (
-        [UserId] NVARCHAR(100), 
-        [AttributeKey] NVARCHAR(50), 
-        [AttributeValue] NVARCHAR(100), 
-        PRIMARY KEY ([UserId], [AttributeKey], [AttributeValue])
-    );
-END
-
-GO
-
--- ======================================================
--- CORE SECURITY FUNCTIONS
--- ======================================================
-
--- Check if the current session user has a specific permission
-CREATE OR ALTER FUNCTION [dbo].[fn_HasPermission] (@Permission NVARCHAR(100))
-RETURNS BIT
-AS
-BEGIN
-    DECLARE @CurrentUserId NVARCHAR(100) = CAST(SESSION_CONTEXT(N'app.current_user') AS NVARCHAR(100));
-    
-    IF EXISTS (
-        SELECT 1 FROM [dbo].[User_Role] ur
-        JOIN [dbo].[Role_Permission] rp ON rp.[RoleName] = ur.[RoleName]
-        WHERE ur.[UserId] = ISNULL(@CurrentUserId, 'anonymous')
-          AND rp.[Permission] = @Permission
-    )
-        RETURN 1;
-
-    RETURN 0;
-END;
-GO
-
--- Check if the current session user has a matching attribute (supports wildcards)
-CREATE OR ALTER FUNCTION [dbo].[fn_HasAttrAccess] (@Key NVARCHAR(50), @Val NVARCHAR(100))
-RETURNS BIT
-AS
-BEGIN
-    DECLARE @CurrentUserId NVARCHAR(100) = CAST(SESSION_CONTEXT(N'app.current_user') AS NVARCHAR(100));
-    
-    IF EXISTS (
-        SELECT 1 FROM [dbo].[User_Attribute] ua
-        WHERE ua.[UserId] = ISNULL(@CurrentUserId, 'anonymous')
-          AND ua.[AttributeKey] = @Key
-          AND (ua.[AttributeValue] = @Val OR ua.[AttributeValue] = '*')
-    )
-        RETURN 1;
-
-    RETURN 0;
-END;
-GO
-
--- Checks if a user is authorized based on a permission and optional attribute
-CREATE OR ALTER FUNCTION [dbo].[fn_Auth] (
-    @Permission NVARCHAR(100),
-    @AttrKey    NVARCHAR(50) = NULL,
-    @AttrValue  NVARCHAR(100) = NULL
-)
-RETURNS BIT
-AS
-BEGIN
-    -- 1. Must have the base permission
-    IF [dbo].[fn_HasPermission](@Permission) = 0
-        RETURN 0;
-
-    -- 2. If an attribute check is requested, must have matching attribute
-    IF @AttrKey IS NOT NULL AND [dbo].[fn_HasAttrAccess](@AttrKey, @AttrValue) = 0
-        RETURN 0;
-
-    RETURN 1;
-END;
-GO
-
--- ======================================================
--- APP: TABLES
--- ======================================================
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Employee]') AND type in (N'U'))
 BEGIN
 CREATE TABLE [dbo].[Employee] (
@@ -141,107 +70,182 @@ BEGIN
         [Reason] NVARCHAR(2000)
     );
 END
+
 GO
 
--- ======================================================
--- APP: SAMPLE DATA / SEED
--- ======================================================
+-- ============================================================================
+-- SAMPLE DATA / SEED
+-- ============================================================================
 
--- Roles
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Role] WHERE [RoleName] = 'Standard_User')
-BEGIN
-    INSERT INTO [dbo].[Role] ([RoleName], [Description]) VALUES 
-    ('Standard_User', 'Normal Employee'),
-    ('HR_Manager', 'Human Resources Manager');
-END
+IF NOT EXISTS (SELECT 1 FROM Role WHERE RoleName = 'Standard_User')
+    INSERT INTO Role (RoleName, Description) VALUES ('Standard_User', 'Normal Employee');
 
--- Permissions
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Role_Permission] WHERE [RoleName] = 'Standard_User' AND [Permission] = 'Employee:Read_Public')
-BEGIN
-    INSERT INTO [dbo].[Role_Permission] ([RoleName], [Permission]) VALUES 
-    ('Standard_User', 'Employee:Read_Public'),
+IF NOT EXISTS (SELECT 1 FROM Role WHERE RoleName = 'HR_Manager')
+    INSERT INTO Role (RoleName, Description) VALUES ('HR_Manager', 'Human Resources Manager');
+
+IF NOT EXISTS (SELECT 1 FROM Role_Permission WHERE RoleName = 'Standard_User')
+    INSERT INTO Role_Permission (RoleName, Permission) VALUES ('Standard_User', 'Employee:Read_Public');
+
+IF NOT EXISTS (SELECT 1 FROM Role_Permission WHERE RoleName = 'HR_Manager')
+    INSERT INTO Role_Permission (RoleName, Permission) VALUES 
     ('HR_Manager', 'Employee:Read_Public'),
     ('HR_Manager', 'Salary:Read');
-END
 
--- User Attributes (for the Department context)
-IF NOT EXISTS (SELECT 1 FROM [dbo].[User_Attribute] WHERE [UserId] = 'jane.smith@firma.de')
+-- Insert claims (Roles and Departments)
+IF NOT EXISTS (SELECT 1 FROM User_Claim WHERE UserId = 'jane.smith@firma.de')
 BEGIN
-    INSERT INTO [dbo].[User_Attribute] ([UserId], [AttributeKey], [AttributeValue]) VALUES 
-    ('jane.smith@firma.de', 'Department', 'IT'),
-    ('john.doe@firma.de', 'Department', 'Sales'),
-    ('hr.boss@firma.de', 'Department', '*');
-END
+    INSERT INTO User_Claim (UserId, ClaimType, ClaimValue, AuditSource, AuditReason) VALUES 
+    ('jane.smith@firma.de', 'Department', 'IT', 'System_Init', 'Initial Setup'),
+    ('jane.smith@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+    ('john.doe@firma.de', 'Department', 'Sales', 'System_Init', 'Initial Setup'),
+    ('john.doe@firma.de', 'Role', 'Standard_User', 'System_Init', 'Initial Setup'),
+    ('hr.boss@firma.de', 'Department', '*', 'System_Init', 'Initial Setup'),
+    ('hr.boss@firma.de', 'Role', 'HR_Manager', 'System_Init', 'Initial Setup');
+END;
 
--- User Roles
-IF NOT EXISTS (SELECT 1 FROM [dbo].[User_Role] WHERE [UserId] = 'jane.smith@firma.de')
-BEGIN
-    INSERT INTO [dbo].[User_Role] ([UserId], [RoleName]) VALUES 
-    ('jane.smith@firma.de', 'Standard_User'),
-    ('john.doe@firma.de', 'Standard_User'),
-    ('hr.boss@firma.de', 'HR_Manager');
-END
+-- Explicitly inserting IDs requires turning on IDENTITY_INSERT
+SET IDENTITY_INSERT Employee ON;
+IF NOT EXISTS (SELECT 1 FROM Employee WHERE Id = 1)
+    INSERT INTO Employee (Id, Name, Department, AnnualSalary, BonusGoal) VALUES 
+    (1, 'Jane Smith', 'IT', 82000, 'System Uptime'),
+    (2, 'John Doe', 'Sales', 65000, '10% Sales Increase');
+SET IDENTITY_INSERT Employee OFF;
 
--- Employees
-IF NOT EXISTS (SELECT 1 FROM [dbo].[Employee] WHERE [Id] IN (1, 2))
-BEGIN
-    SET IDENTITY_INSERT [dbo].[Employee] ON;
-    INSERT INTO [dbo].[Employee] ([Id], [Name], [Department], [AnnualSalary], [BonusGoal], [Region]) VALUES 
-    (1, 'Jane Smith', 'IT', 82000, 'System Uptime', 'North'),
-    (2, 'John Doe', 'Sales', 65000, '10% Sales Increase', 'South');
-    SET IDENTITY_INSERT [dbo].[Employee] OFF;
-END
-
--- Bonus Payments
-IF NOT EXISTS (SELECT 1 FROM [dbo].[BonusPayment] WHERE [Id] IN (1, 2))
-BEGIN
-    SET IDENTITY_INSERT [dbo].[BonusPayment] ON;
-    INSERT INTO [dbo].[BonusPayment] ([Id], [EmployeeId], [Amount], [Reason]) VALUES 
+SET IDENTITY_INSERT BonusPayment ON;
+IF NOT EXISTS (SELECT 1 FROM BonusPayment WHERE Id = 1)
+    INSERT INTO BonusPayment (Id, EmployeeId, Amount, Reason) VALUES 
     (1, 1, 5000.00, 'Excellent Uptime'),
     (2, 2, 3000.00, 'Q1 Target Met');
-    SET IDENTITY_INSERT [dbo].[BonusPayment] OFF;
-END
+SET IDENTITY_INSERT BonusPayment OFF;
+
+GO
+
+-- ============================================================================
+-- EFFECTIVE CLAIMS VIEW
+-- ============================================================================
+
+CREATE OR ALTER VIEW vw_Effective_Claims AS
+    -- Direct Claims (Overrides, Departments, Base Roles)
+    SELECT 
+        UserId, 
+        ClaimType, 
+        ClaimValue,
+        AuditSource AS Lineage,
+        AuditReason AS Reason
+    FROM User_Claim
+    
+    UNION ALL
+    
+    -- Inherited Permissions (Exploding the Roles)
+    SELECT 
+        uc.UserId, 
+        'Permission' AS ClaimType, 
+        rp.Permission AS ClaimValue,
+        'Inherited via Role: ' + uc.ClaimValue AS Lineage, 
+        uc.AuditReason AS Reason
+    FROM User_Claim uc
+    JOIN Role_Permission rp ON rp.RoleName = uc.ClaimValue
+    WHERE uc.ClaimType = 'Role';
+
 GO
 
 -- ======================================================
--- APP: SECURE VIEWS
+-- CORE SECURITY FUNCTIONS
 -- ======================================================
 
--- Secure view for Employees
-CREATE OR ALTER VIEW [dbo].[vw_Employee_Secure]
+CREATE OR ALTER FUNCTION dbo.has_claim(@p_type VARCHAR(50), @p_value VARCHAR(100))
+RETURNS BIT
 AS
+BEGIN
+    RETURN (
+        SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM vw_Effective_Claims 
+            WHERE UserId = ISNULL(CAST(SESSION_CONTEXT(N'app.current_user') AS VARCHAR(100)), 'anonymous')
+              AND ClaimType = @p_type 
+              AND ClaimValue = @p_value
+        ) THEN 1 ELSE 0 END
+    );
+END;
+GO
+
+CREATE OR ALTER FUNCTION dbo.has_permission(@p_permission VARCHAR(100))
+RETURNS BIT
+AS
+BEGIN
+    RETURN dbo.has_claim('Permission', @p_permission);
+END;
+GO
+
+CREATE OR ALTER FUNCTION dbo.has_department_access(@p_department VARCHAR(100))
+RETURNS BIT
+AS
+BEGIN
+    RETURN (
+        SELECT CASE WHEN 
+            dbo.has_claim('Department', '*') = 1 OR 
+            dbo.has_claim('Department', @p_department) = 1 
+        THEN 1 ELSE 0 END
+    );
+END;
+GO
+
+
+-- ======================================================
+-- SECURE VIEWS
+-- ======================================================
+
+CREATE OR ALTER VIEW vw_Employee_Secure AS 
 SELECT 
-    e.[Id], 
-    e.[Name], 
-    e.[Department],
+    e.Id, 
+    e.Name, 
+    e.Department,
     
     -- FIELD-LEVEL SECURITY
-    -- Mask AnnualSalary if lacks Salary:Read OR lack Department access
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, e.[AnnualSalary], NULL) AS [AnnualSalary],
-    
-    -- Mask BonusGoal based on base permission
-    IIF([dbo].[fn_Auth]('Salary:Read', NULL, NULL) = 1, e.[BonusGoal], NULL) AS [BonusGoal]
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN e.AnnualSalary ELSE NULL END AS AnnualSalary,
+         
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 
+         THEN e.BonusGoal ELSE NULL END AS BonusGoal
 
-FROM [dbo].[Employee] e
+FROM Employee e
 -- ROW-LEVEL SECURITY
-WHERE [dbo].[fn_Auth]('Employee:Read_Public', NULL, NULL) = 1;
+WHERE dbo.has_permission('Employee:Read_Public') = 1;
+
 GO
 
--- Secure view for Bonus Payments with relationship security
-CREATE OR ALTER VIEW [dbo].[vw_BonusPayment_Secure]
-AS
+CREATE OR ALTER VIEW vw_BonusPayment_Secure AS
 SELECT
-    bp.[Id],
-    bp.[EmployeeId],
+    bp.Id,
+    bp.EmployeeId,
     
-    -- FIELD-LEVEL SECURITY: Only visible if user has Salary:Read AND access to parent Employee's department
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, bp.[Amount], NULL) AS [Amount],
-    IIF([dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1, bp.[Reason], NULL) AS [Reason]
+    -- FIELD-LEVEL SECURITY
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN bp.Amount ELSE NULL END AS Amount,
+         
+    CASE WHEN dbo.has_permission('Salary:Read') = 1 AND dbo.has_department_access(e.Department) = 1 
+         THEN bp.Reason ELSE NULL END AS Reason
 
-FROM [dbo].[BonusPayment] bp
-JOIN [dbo].[Employee] e ON bp.[EmployeeId] = e.[Id]
--- ROW-LEVEL SECURITY: Bonus payments are filtered out if lacks Salary:Read OR lacks access to the employee's department.
-WHERE [dbo].[fn_Auth]('Salary:Read', 'Department', e.[Department]) = 1;
+FROM BonusPayment bp
+JOIN Employee e ON bp.EmployeeId = e.Id
+-- ROW-LEVEL SECURITY
+WHERE dbo.has_permission('Salary:Read') = 1 
+  AND dbo.has_department_access(e.Department) = 1;
+
+GO
+
+-- ============================================================================
+-- AUDIT FUNCTION
+-- ============================================================================
+
+CREATE OR ALTER FUNCTION dbo.fn_audit_user(@p_userid VARCHAR(100))
+RETURNS TABLE
+AS
+RETURN (
+    SELECT ClaimType, ClaimValue, Lineage, Reason 
+    FROM vw_Effective_Claims
+    WHERE UserId = @p_userid
+);
+
 GO
 
 -- ======================================================
@@ -261,22 +265,17 @@ BEGIN
 END
 GO
 
--- Grant EXECUTE on the security functions so the views can evaluate them
-GRANT EXECUTE ON [dbo].[fn_HasPermission] TO [ODataApiUser];
-GRANT EXECUTE ON [dbo].[fn_HasAttrAccess] TO [ODataApiUser];
-GRANT EXECUTE ON [dbo].[fn_Auth] TO [ODataApiUser];
+-- Grant explicit SELECT access ONLY to the secure views
+GRANT SELECT ON vw_Employee_Secure TO [ODataApiUser];
+GRANT SELECT ON vw_BonusPayment_Secure TO [ODataApiUser];
 
--- Grant SELECT ONLY on the secure views
-GRANT SELECT ON [dbo].[vw_Employee_Secure] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[vw_BonusPayment_Secure] TO [ODataApiUser];
+-- Grant execution rights to the functions so the views can use them
+GRANT EXECUTE ON dbo.has_claim TO [ODataApiUser];
+GRANT EXECUTE ON dbo.has_permission TO [ODataApiUser];
+GRANT EXECUTE ON dbo.has_department_access TO [ODataApiUser];
 
--- Explicitly ensure NO access to the raw tables
-DENY SELECT ON [dbo].[Employee] TO [ODataApiUser];
-DENY SELECT ON [dbo].[BonusPayment] TO [ODataApiUser];
-
--- Grant SELECT on metadata tables required for the functions to work
-GRANT SELECT ON [dbo].[Role] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[Role_Permission] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[User_Role] TO [ODataApiUser];
-GRANT SELECT ON [dbo].[User_Attribute] TO [ODataApiUser];
-GO
+-- Grant read access to the metadata tables and views
+GRANT SELECT ON Role TO [ODataApiUser];
+GRANT SELECT ON Role_Permission TO [ODataApiUser];
+GRANT SELECT ON User_Claim TO [ODataApiUser];
+GRANT SELECT ON vw_Effective_Claims TO [ODataApiUser];
